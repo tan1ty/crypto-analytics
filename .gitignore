@@ -11,3 +11,5 @@ data/*.csv
 
 # Jupyter
 .ipynb_checkpoints/
+
+data/raw/*.csv
