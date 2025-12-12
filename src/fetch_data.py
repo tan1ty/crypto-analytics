@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional, Union
@@ -7,25 +8,16 @@ from typing import Optional, Union
 import pandas as pd
 import requests
 
-
 BINANCE_BASE_URL = "https://api.binance.com"
 
 
 def to_millis(dt: Union[str, int, float, datetime]) -> int:
-    """
-    Accepts:
-      - datetime (aware/naive; naive assumed UTC)
-      - ISO string like "2024-01-01 00:00:00" or "2024-01-01T00:00:00"
-      - seconds (int/float) or milliseconds (int) timestamps
-    Returns milliseconds since epoch (UTC).
-    """
     if isinstance(dt, datetime):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
 
     if isinstance(dt, (int, float)):
-        # Heuristic: if it's too small, treat as seconds
         return int(dt * 1000) if dt < 10_000_000_000 else int(dt)
 
     if isinstance(dt, str):
@@ -47,11 +39,6 @@ def fetch_klines(
     session: Optional[requests.Session] = None,
     sleep_seconds: float = 0.2,
 ) -> pd.DataFrame:
-    """
-    Fetches historical klines (OHLCV) from Binance REST API and returns a DataFrame.
-
-    Binance endpoint returns up to `limit` candles per request, so we paginate from start_time to end_time.
-    """
     start_ms = to_millis(start_time)
     end_ms = to_millis(end_time) if end_time is not None else None
 
@@ -81,20 +68,19 @@ def fetch_klines(
         rows.extend(chunk)
 
         last_open_time = chunk[-1][0]
-        next_open_time = last_open_time + 1  # move forward (ms) to avoid duplicates
+        next_open_time = last_open_time + 1
 
         if end_ms is not None and next_open_time >= end_ms:
             break
 
         if next_open_time <= cur:
-            # Safety to avoid infinite loop if API behaves unexpectedly
             break
 
         cur = next_open_time
         time.sleep(sleep_seconds)
 
     if not rows:
-        return pd.DataFrame(columns=["open_time","open","high","low","close","volume","close_time"])
+        return pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume", "close_time"])
 
     df = pd.DataFrame(
         rows,
@@ -114,29 +100,83 @@ def fetch_klines(
         ],
     )
 
-    # Types
     numeric_cols = ["open", "high", "low", "close", "volume"]
     df[numeric_cols] = df[numeric_cols].astype(float)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
 
-    # Keep only what you asked for (OHLCV + times)
-    df = df[["open_time", "open", "high", "low", "close", "volume", "close_time"]].copy()
+    return df[["open_time", "open", "high", "low", "close", "volume", "close_time"]].copy()
+
+
+def ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def load_existing_csv(path: str) -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path, parse_dates=["open_time", "close_time"])
+    # на всякий випадок: приводимо до UTC
+    df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
     return df
 
 
-def save_klines_csv(df: pd.DataFrame, path: str) -> None:
-    df.to_csv(path, index=False)
+def update_klines_csv(
+    symbol: str,
+    interval: str,
+    path: str,
+    start_time_if_empty: Union[str, datetime],
+    end_time: Optional[Union[str, datetime]] = None,
+) -> pd.DataFrame:
+    """
+    Якщо файл існує — визначаємо останній open_time і дотягуємо тільки нові свічки.
+    Якщо файлу нема — качаємо з start_time_if_empty.
+    """
+    ensure_parent_dir(path)
+
+    existing = load_existing_csv(path)
+    if existing is None or existing.empty:
+        fetch_start = start_time_if_empty
+        base = pd.DataFrame()
+    else:
+        last_open = existing["open_time"].max()
+        # наступна свічка після останньої (щоб не дублювати)
+        fetch_start = (last_open.to_pydatetime()).replace(tzinfo=timezone.utc)
+        base = existing
+
+    new_df = fetch_klines(symbol, interval, fetch_start, end_time=end_time)
+
+    if base.empty:
+        merged = new_df
+    else:
+        merged = pd.concat([base, new_df], ignore_index=True)
+
+    # прибрати дублікати по open_time (на випадок перетинів)
+    merged = merged.drop_duplicates(subset=["open_time"], keep="last")
+    merged = merged.sort_values("open_time").reset_index(drop=True)
+
+    merged.to_csv(path, index=False)
+    return merged
 
 
 if __name__ == "__main__":
     symbol = "BTCUSDT"
     interval = "1h"
-    start = "2024-01-01 00:00:00"
-    end = "2024-01-08 00:00:00"
-
-    df = fetch_klines(symbol, interval, start, end)
     out_path = f"data/raw/binance_{symbol}_{interval}.csv"
-    save_klines_csv(df, out_path)
-    print(df.head())
-    print(f"Saved: {out_path} | rows={len(df)}")
+
+    # якщо файл ще не існує — з якої дати починати історію
+    start_if_empty = "2024-01-01 00:00:00"
+
+    df = update_klines_csv(
+        symbol=symbol,
+        interval=interval,
+        path=out_path,
+        start_time_if_empty=start_if_empty,
+        end_time=None,  # None = качати аж до "зараз" (Binance сам віддає доступне)
+    )
+
+    print(df.tail())
+    print(f"Saved/updated: {out_path} | rows={len(df)}")
