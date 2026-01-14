@@ -8,6 +8,9 @@ from typing import Optional, Union
 import pandas as pd
 import requests
 
+import argparse
+from .config import SETTINGS, Settings
+
 BINANCE_BASE_URL = "https://api.binance.com"
 
 
@@ -180,3 +183,35 @@ if __name__ == "__main__":
 
     print(df.tail())
     print(f"Saved/updated: {out_path} | rows={len(df)}")
+
+def update_data(symbol: str, interval: str, out_path: str, start_if_empty: str) -> None:
+    df = update_klines_csv(
+        symbol=symbol,
+        interval=interval,
+        path=out_path,
+        start_time_if_empty=start_if_empty,
+        end_time=None,
+    )
+    print(f"Saved/updated: {out_path} | rows={len(df)}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Fetch & update Binance klines (OHLCV) into CSV.")
+    p.add_argument("--symbol", default=SETTINGS.symbol)
+    p.add_argument("--interval", default=SETTINGS.interval)
+    p.add_argument("--out", default=None, help="Output CSV path (optional).")
+    p.add_argument("--start-if-empty", default=SETTINGS.start_if_empty)
+    args = p.parse_args()
+
+    # якщо шлях не заданий — беремо з config-логіки
+    if args.out is None:
+        s = Settings(symbol=args.symbol, interval=args.interval, data_dir=SETTINGS.data_dir, start_if_empty=args.start_if_empty)
+        out_path = s.out_path()
+    else:
+        out_path = args.out
+
+    update_data(args.symbol, args.interval, out_path, args.start_if_empty)
+
+
+if __name__ == "__main__":
+    main()
