@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import time
 from datetime import datetime, timezone
@@ -8,8 +9,7 @@ from typing import Optional, Union
 import pandas as pd
 import requests
 
-import argparse
-from .config import SETTINGS, Settings
+from .config import SETTINGS
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
@@ -33,6 +33,24 @@ def to_millis(dt: Union[str, int, float, datetime]) -> int:
     raise TypeError(f"Unsupported time type: {type(dt)}")
 
 
+def interval_to_millis(interval: str) -> int:
+    s = interval.strip()
+    unit = s[-1]
+    n = int(s[:-1])
+
+    if unit == "m":
+        return n * 60_000
+    if unit == "h":
+        return n * 3_600_000
+    if unit == "d":
+        return n * 86_400_000
+    if unit == "w":
+        return n * 7 * 86_400_000
+    if unit == "M":
+        raise ValueError("Interval '1M' is not supported for incremental start calculation.")
+    raise ValueError(f"Unsupported interval: {interval}")
+
+
 def fetch_klines(
     symbol: str,
     interval: str,
@@ -52,12 +70,7 @@ def fetch_klines(
     cur = start_ms
 
     while True:
-        params = {
-            "symbol": symbol.upper(),
-            "interval": interval,
-            "startTime": cur,
-            "limit": limit,
-        }
+        params = {"symbol": symbol.upper(), "interval": interval, "startTime": cur, "limit": limit}
         if end_ms is not None:
             params["endTime"] = end_ms
 
@@ -103,8 +116,7 @@ def fetch_klines(
         ],
     )
 
-    numeric_cols = ["open", "high", "low", "close", "volume"]
-    df[numeric_cols] = df[numeric_cols].astype(float)
+    df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
 
@@ -121,33 +133,37 @@ def load_existing_csv(path: str) -> Optional[pd.DataFrame]:
     if not os.path.exists(path):
         return None
     df = pd.read_csv(path, parse_dates=["open_time", "close_time"])
-    # на всякий випадок: приводимо до UTC
     df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
     return df
 
 
-def update_klines_csv(
+def update_data(
     symbol: str,
     interval: str,
-    path: str,
-    start_time_if_empty: Union[str, datetime],
+    out_path: str,
+    start_if_empty: Union[str, datetime],
     end_time: Optional[Union[str, datetime]] = None,
 ) -> pd.DataFrame:
     """
-    Якщо файл існує — визначаємо останній open_time і дотягуємо тільки нові свічки.
-    Якщо файлу нема — качаємо з start_time_if_empty.
+    План День 5–6:
+    - читає останній timestamp у CSV
+    - догружає лише нові свічки
+    - додає їх у кінець того ж файлу
     """
-    ensure_parent_dir(path)
+    ensure_parent_dir(out_path)
 
-    existing = load_existing_csv(path)
+    existing = load_existing_csv(out_path)
+    old_len = 0 if existing is None else len(existing)
+
     if existing is None or existing.empty:
-        fetch_start = start_time_if_empty
+        fetch_start = start_if_empty
         base = pd.DataFrame()
     else:
         last_open = existing["open_time"].max()
-        # наступна свічка після останньої (щоб не дублювати)
-        fetch_start = (last_open.to_pydatetime()).replace(tzinfo=timezone.utc)
+        step_ms = interval_to_millis(interval)
+        fetch_start_ms = int(last_open.timestamp() * 1000) + step_ms
+        fetch_start = pd.to_datetime(fetch_start_ms, unit="ms", utc=True).to_pydatetime()
         base = existing
 
     new_df = fetch_klines(symbol, interval, fetch_start, end_time=end_time)
@@ -157,60 +173,34 @@ def update_klines_csv(
     else:
         merged = pd.concat([base, new_df], ignore_index=True)
 
-    # прибрати дублікати по open_time (на випадок перетинів)
     merged = merged.drop_duplicates(subset=["open_time"], keep="last")
     merged = merged.sort_values("open_time").reset_index(drop=True)
 
-    merged.to_csv(path, index=False)
+    merged.to_csv(out_path, index=False)
+
+    added = len(merged) - old_len
+    print(f"Saved/updated: {out_path} | total_rows={len(merged)} | added_rows={added}")
+
     return merged
 
 
-if __name__ == "__main__":
-    symbol = "BTCUSDT"
-    interval = "1h"
-    out_path = f"data/raw/binance_{symbol}_{interval}.csv"
-
-    # якщо файл ще не існує — з якої дати починати історію
-    start_if_empty = "2024-01-01 00:00:00"
-
-    df = update_klines_csv(
-        symbol=symbol,
-        interval=interval,
-        path=out_path,
-        start_time_if_empty=start_if_empty,
-        end_time=None,  # None = качати аж до "зараз" (Binance сам віддає доступне)
-    )
-
-    print(df.tail())
-    print(f"Saved/updated: {out_path} | rows={len(df)}")
-
-def update_data(symbol: str, interval: str, out_path: str, start_if_empty: str) -> None:
-    df = update_klines_csv(
-        symbol=symbol,
-        interval=interval,
-        path=out_path,
-        start_time_if_empty=start_if_empty,
-        end_time=None,
-    )
-    print(f"Saved/updated: {out_path} | rows={len(df)}")
-
-
 def main() -> None:
-    p = argparse.ArgumentParser(description="Fetch & update Binance klines (OHLCV) into CSV.")
+    p = argparse.ArgumentParser(description="Fetch & update Binance OHLCV candles into a CSV file.")
     p.add_argument("--symbol", default=SETTINGS.symbol)
     p.add_argument("--interval", default=SETTINGS.interval)
     p.add_argument("--out", default=None, help="Output CSV path (optional).")
     p.add_argument("--start-if-empty", default=SETTINGS.start_if_empty)
     args = p.parse_args()
 
-    # якщо шлях не заданий — беремо з config-логіки
-    if args.out is None:
-        s = Settings(symbol=args.symbol, interval=args.interval, data_dir=SETTINGS.data_dir, start_if_empty=args.start_if_empty)
-        out_path = s.out_path()
-    else:
-        out_path = args.out
+    out_path = args.out or SETTINGS.out_path(symbol=args.symbol, interval=args.interval)
 
-    update_data(args.symbol, args.interval, out_path, args.start_if_empty)
+    update_data(
+        symbol=args.symbol,
+        interval=args.interval,
+        out_path=out_path,
+        start_if_empty=args.start_if_empty,
+        end_time=None,
+    )
 
 
 if __name__ == "__main__":
